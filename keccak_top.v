@@ -1,10 +1,14 @@
 // -----------------------------------------------------------------------------
 // keccak_top.v
 // PUF mode (704-bit) and block mode (stream of 32-bit words)
+// Adds hash_init: 1-cycle reset of sponge for starting a NEW message.
 // -----------------------------------------------------------------------------
 module keccak_top (
     input           clk,
     input           reset,
+
+    // NEW: reset sponge for a NEW message (1-cycle pulse)
+    input           sha_init,
 
     input           mode_puf,
     input           mode_block,
@@ -13,7 +17,7 @@ module keccak_top (
     input           start_puf,
     input  [703:0]  data_in,
 
-    // Block input (for HMAC streaming)
+    // Block input
     input           start_block,
     input  [31:0]   block_word,
     input           block_word_valid,
@@ -31,6 +35,7 @@ module keccak_top (
 
     reg [703:0] puf_buffer;
     reg [5:0]   puf_words_left;
+
     reg [5:0]   blk_words_left;
 
     reg         busy_r;
@@ -42,9 +47,11 @@ module keccak_top (
 
     assign busy = busy_r;
 
+    // IMPORTANT:
+    // sha_init resets the sponge state for a fresh hash computation.
     keccak keccak_inst (
         .clk(clk),
-        .reset(reset),
+        .reset(reset | sha_init),
         .in(ke_in),
         .in_ready(ke_in_ready),
         .is_last(ke_is_last),
@@ -55,28 +62,29 @@ module keccak_top (
     );
 
     always @(posedge clk) begin
-        if (reset) begin
+        if (reset | sha_init) begin
             puf_buffer     <= 0;
             puf_words_left <= 0;
             blk_words_left <= 0;
 
-            ke_in         <= 0;
-            ke_in_ready   <= 0;
-            ke_is_last    <= 0;
+            ke_in       <= 0;
+            ke_in_ready <= 0;
+            ke_is_last  <= 0;
 
-            busy_r        <= 0;
+            busy_r      <= 0;
         end else begin
             ke_in_ready <= 0;
             ke_is_last  <= 0;
 
             // -------------------------
-            // PUF MODE
+            // PUF MODE (704-bit)
             // -------------------------
-            if (mode_puf) begin
+            // Use else-if to prevent race condition between modes
+            if (mode_puf && !mode_block) begin
                 if (start_puf && !busy_r) begin
                     puf_buffer     <= data_in;
-                    puf_words_left <= NUM_WORDS;
-                    busy_r         <= 1;
+                    puf_words_left <= NUM_WORDS; // 22
+                    busy_r         <= 1'b1;
                 end
 
                 if (busy_r && (puf_words_left != 0) && !buffer_full) begin
@@ -86,22 +94,20 @@ module keccak_top (
                     if (puf_words_left == 1)
                         ke_is_last <= 1'b1;
 
-                    puf_buffer     <= puf_buffer >> 32;
+                    puf_buffer     <= (puf_buffer >> 32);
                     puf_words_left <= puf_words_left - 1;
 
                     if (puf_words_left == 1)
-                        busy_r <= 0;
+                        busy_r <= 1'b0;
                 end
             end
-
             // -------------------------
-            // BLOCK MODE
+            // BLOCK MODE (stream)
             // -------------------------
-            if (mode_block) begin
-                // IMPORTANT: don't start a block if padder is full
+            else if (mode_block && !mode_puf) begin
                 if (start_block && !busy_r && !buffer_full) begin
                     blk_words_left <= words_in_block;
-                    busy_r         <= 1;
+                    busy_r         <= 1'b1;
                 end
 
                 if (busy_r && block_word_valid && !buffer_full) begin
@@ -114,7 +120,7 @@ module keccak_top (
                     blk_words_left <= blk_words_left - 1;
 
                     if (blk_words_left == 1)
-                        busy_r <= 0;
+                        busy_r <= 1'b0;
                 end
             end
         end

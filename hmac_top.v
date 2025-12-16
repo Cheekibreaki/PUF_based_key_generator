@@ -9,29 +9,30 @@ module hmac_top(
     input               start_puf,
     input               start_hmac,
 
-    input      [703:0]   puf_input,
+    input      [703:0]  puf_input,
 
-    // 32-bit message stream into HMAC
-    input      [31:0]    msg_word,
+    input      [31:0]   msg_word,
     input               msg_valid,
     input               msg_last,
     output              msg_ready,
 
-    output     [511:0]   puf_key,
-    output     [511:0]   hmac_value,
+    output     [511:0]  puf_key,
+    output     [511:0]  hmac_value,
     output              done
 );
 
+    wire sha_init;
+
     wire mode_puf, mode_block;
 
-    wire        sha_start_puf;
-    wire [703:0] sha_puf_data;
+    wire start_puf_o;
+    wire [703:0] puf_data_o;
 
-    wire        sha_start_block;
-    wire [31:0] sha_block_word;
-    wire        sha_block_word_valid;
-    wire        sha_block_last;
-    wire [5:0]  sha_words_in_block;
+    wire start_block_o;
+    wire [31:0]  block_word_o;
+    wire         block_word_valid_o;
+    wire         block_last_o;
+    wire [5:0]   words_in_block_o;
 
     wire [511:0] sha_out;
     wire         sha_out_ready;
@@ -56,17 +57,19 @@ module hmac_top(
         .hmac_out(hmac_value),
         .done(done),
 
+        .sha_init(sha_init),
+
         .mode_puf(mode_puf),
         .mode_block(mode_block),
 
-        .sha_start_puf(sha_start_puf),
-        .sha_puf_data(sha_puf_data),
+        .start_puf_o(start_puf_o),
+        .puf_data_o(puf_data_o),
 
-        .sha_start_block(sha_start_block),
-        .sha_block_word(sha_block_word),
-        .sha_block_word_valid(sha_block_word_valid),
-        .sha_block_last(sha_block_last),
-        .sha_words_in_block(sha_words_in_block),
+        .start_block_o(start_block_o),
+        .block_word_o(block_word_o),
+        .block_word_valid_o(block_word_valid_o),
+        .block_last_o(block_last_o),
+        .words_in_block_o(words_in_block_o),
 
         .sha_out(sha_out),
         .sha_out_ready(sha_out_ready),
@@ -78,17 +81,19 @@ module hmac_top(
         .clk(clk),
         .reset(reset),
 
+        .sha_init(sha_init),
+
         .mode_puf(mode_puf),
         .mode_block(mode_block),
 
-        .start_puf(sha_start_puf),
-        .data_in(sha_puf_data),
+        .start_puf(start_puf_o),
+        .data_in(puf_data_o),
 
-        .start_block(sha_start_block),
-        .block_word(sha_block_word),
-        .block_word_valid(sha_block_word_valid),
-        .block_last(sha_block_last),
-        .words_in_block(sha_words_in_block),
+        .start_block(start_block_o),
+        .block_word(block_word_o),
+        .block_word_valid(block_word_valid_o),
+        .block_last(block_last_o),
+        .words_in_block(words_in_block_o),
 
         .busy(sha_busy),
         .buffer_full(sha_buffer_full),
