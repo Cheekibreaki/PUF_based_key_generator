@@ -20,7 +20,7 @@ module device_rfe_gen
 
     // PUF Interface - NEW PROTOCOL
     // Read PUF_BLOCKS*N bits total, 8 bits at a time
-    output reg                        puf_clk,     // Clock for PUF
+    output wire                       puf_clk,     // Clock for PUF (same freq as clk)
     output reg                        puf_enable,  // Enable signal for PUF
     output reg  [$clog2((PUF_BLOCKS*N)/8)-1:0] puf_addr,  // Address (byte address)
     input  wire [7:0]                 puf_data,    // 8-bit data from PUF
@@ -123,6 +123,9 @@ module device_rfe_gen
 
     reg [2:0] state, next_state;
 
+    // PUF clock generation - runs at same frequency as main clk when enabled
+    assign puf_clk = (puf_enable && state == S_PUF_READ) ? clk : 1'b0;
+
     // State register
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) state <= S_IDLE;
@@ -143,7 +146,7 @@ module device_rfe_gen
     // Outputs and latches
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            puf_clk        <= 1'b0;
+            // puf_clk is now a wire, driven by assign statement
             puf_enable     <= 1'b0;
             // puf_addr is now controlled by separate always @(posedge puf_clk) block
             puf_byte_count <= {($clog2(PUF_BYTES)+1){1'b0}};
@@ -168,7 +171,7 @@ module device_rfe_gen
                     have_puf       <= 1'b0;
                     have_trng      <= 1'b0;
                     puf_enable     <= 1'b0;
-                    puf_clk        <= 1'b0;
+                    // puf_clk is now a wire, driven by assign statement
                     // puf_addr is now controlled by separate always @(posedge puf_clk) block
                     puf_byte_count <= {($clog2(PUF_BYTES)+1){1'b0}};
                     puf_read_state <= 1'b0;
@@ -184,31 +187,25 @@ module device_rfe_gen
 
                 S_PUF_READ: begin
                     // PUF reading protocol:
-                    // Toggle puf_clk every main clock cycle
-                    // Separate always block handles addr increment on puf_clk rising edge
-                    // Data capture happens on puf_clk falling edge
+                    // puf_clk = clk when puf_enable is high
+                    // Address increments on puf_clk rising edge (separate always block)
+                    // Data capture happens every clock cycle
 
                     if (!puf_read_state) begin
-                        // First cycle: initialize
+                        // First cycle: initialize and enable
                         puf_enable     <= 1'b1;
-                        puf_clk        <= 1'b0;
                         puf_read_state <= 1'b1;
                         puf_byte_count <= {($clog2(PUF_BYTES)+1){1'b0}};
                     end else begin
-                        // Toggle clock every main clock cycle
-                        puf_clk <= ~puf_clk;
+                        // Every clock cycle: capture data from PUF
+                        // Address was already incremented on rising edge by separate always block
+                        puf_raw_reg[puf_byte_count*8 +: 8] <= puf_data;
+                        puf_byte_count <= puf_byte_count + 1;
 
-                        // On falling edge of puf_clk: capture data
-                        if (puf_clk) begin
-                            // puf_clk is currently high, about to go low (falling edge)
-                            puf_raw_reg[puf_byte_count*8 +: 8] <= puf_data;
-                            puf_byte_count <= puf_byte_count + 1;
-
-                            // Check if we've read all bytes
-                            if (puf_byte_count >= (PUF_BYTES - 1)) begin
-                                have_puf    <= 1'b1;
-                                puf_enable  <= 1'b0;
-                            end
+                        // Check if we've read all bytes
+                        if (puf_byte_count >= (PUF_BYTES - 1)) begin
+                            have_puf    <= 1'b1;
+                            puf_enable  <= 1'b0;
                         end
                     end
                 end
