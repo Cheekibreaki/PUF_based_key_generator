@@ -8,7 +8,7 @@
 // -----------------------------------------------------------------------------
 module device_rfe_gen
 #(
-    parameter integer PUF_BLOCKS = 2,   // Number of N-bit blocks from PUF
+    parameter integer PUF_BLOCKS = 2,   // Number of N-bit blocks from PUF (each block is N bits)
     parameter integer BLOCKS     = 22,   // Number of RM encoding blocks
     parameter integer N          = 32,  // fixed at 32 for RM(1,5)
     parameter integer K          = 6    // fixed at 6  for RM(1,5)
@@ -18,15 +18,18 @@ module device_rfe_gen
     input  wire                       rst_n,
     input  wire                       enable,      // Enable signal to start processing
 
-    // PUF Interface (now takes PUF_BLOCKS*N bits instead of BLOCKS*N)
-    output reg                        puf_read_req,
-    input  wire [PUF_BLOCKS*N-1:0]   puf_data,    // R' (PUF response) - reduced size
-    input  wire                       puf_valid,
+    // PUF Interface - NEW PROTOCOL
+    // Read PUF_BLOCKS*N bits total, 8 bits at a time
+    output reg                        puf_clk,     // Clock for PUF
+    output reg                        puf_enable,  // Enable signal for PUF
+    output reg  [$clog2((PUF_BLOCKS*N)/8)-1:0] puf_addr,  // Address (byte address)
+    input  wire [7:0]                 puf_data,    // 8-bit data from PUF
 
-    // TRNG Interface (still BLOCKS*K bits)
-    output reg                        trng_req,
-    input  wire [BLOCKS*K-1:0]        trng_data,   // x (TRNG bits)
-    input  wire                       trng_valid,
+    // TRNG Interface - NEW PROTOCOL
+    // Read 1 bit per cycle for BLOCKS cycles, replicate each bit K times
+    output reg                        trng_clk,      // Clock for TRNG
+    output reg                        trng_enable,   // Enable signal for TRNG
+    input  wire                       trng_data,     // 1-bit data from TRNG
 
     // Outputs
     output reg  [BLOCKS*N-1:0]        rprime,      // NEW: Replicated PUF data output
@@ -40,11 +43,20 @@ module device_rfe_gen
     reg [BLOCKS*K-1:0]     x_reg;
     reg                    have_puf;
     reg                    have_trng;
-    
+
+    // PUF reading state machine
+    localparam PUF_BYTES = (PUF_BLOCKS * N) / 8;  // Total bytes to read from PUF
+    reg [$clog2(PUF_BYTES):0] puf_byte_count;     // Current byte being read
+    reg                       puf_read_state;     // 0=wait, 1=reading
+
+    // TRNG reading state machine
+    reg [$clog2(BLOCKS):0]    trng_bit_count;     // Current bit being read (0 to BLOCKS-1)
+    reg                       trng_read_state;    // 0=wait, 1=reading
+
     // Edge detection for enable signal
     reg                    enable_d;
     wire                   enable_rising;
-    
+
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) enable_d <= 1'b0;
         else        enable_d <= enable;
@@ -102,13 +114,14 @@ module device_rfe_gen
     endgenerate
 
     // -----------------------------------------------------------------------------
-    // Simple handshake + latching FSM (three phases)
+    // Simple handshake + latching FSM (five phases)
     // -----------------------------------------------------------------------------
-    localparam [1:0] S_IDLE = 2'd0,
-                     S_REQ  = 2'd1,
-                     S_OUT  = 2'd2;
+    localparam [2:0] S_IDLE      = 3'd0,
+                     S_PUF_READ  = 3'd1,
+                     S_TRNG_READ = 3'd2,
+                     S_OUT       = 3'd3;
 
-    reg [1:0] state, next_state;
+    reg [2:0] state, next_state;
 
     // State register
     always @(posedge clk or negedge rst_n) begin
@@ -119,53 +132,125 @@ module device_rfe_gen
     // Next-state logic
     always @(*) begin
         case (state)
-            S_IDLE: next_state = (enable_rising ? S_REQ : S_IDLE);
-            S_REQ : next_state = (have_puf && have_trng) ? S_OUT : S_REQ;
-            S_OUT : next_state = S_IDLE;
-            default: next_state = S_IDLE;
+            S_IDLE:      next_state = (enable_rising ? S_PUF_READ : S_IDLE);
+            S_PUF_READ:  next_state = (have_puf ? S_TRNG_READ : S_PUF_READ);
+            S_TRNG_READ: next_state = (have_trng ? S_OUT : S_TRNG_READ);
+            S_OUT:       next_state = S_IDLE;
+            default:     next_state = S_IDLE;
         endcase
     end
 
     // Outputs and latches
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            puf_read_req  <= 1'b0;
-            trng_req      <= 1'b0;
-            puf_raw_reg   <= {(PUF_BLOCKS*N){1'b0}};
-            x_reg         <= {(BLOCKS*K){1'b0}};
-            have_puf      <= 1'b0;
-            have_trng     <= 1'b0;
-            rprime        <= {(BLOCKS*N){1'b0}};      // Initialize rprime output
-            helper_data   <= {(BLOCKS*N){1'b0}};
-            complete      <= 1'b0;
+            puf_clk        <= 1'b0;
+            puf_enable     <= 1'b0;
+            // puf_addr is now controlled by separate always @(posedge puf_clk) block
+            puf_byte_count <= {($clog2(PUF_BYTES)+1){1'b0}};
+            puf_read_state <= 1'b0;
+            trng_clk       <= 1'b0;
+            trng_enable    <= 1'b0;
+            trng_bit_count <= {($clog2(BLOCKS)+1){1'b0}};
+            trng_read_state<= 1'b0;
+            puf_raw_reg    <= {(PUF_BLOCKS*N){1'b0}};
+            x_reg          <= {(BLOCKS*K){1'b0}};
+            have_puf       <= 1'b0;
+            have_trng      <= 1'b0;
+            rprime         <= {(BLOCKS*N){1'b0}};      // Initialize rprime output
+            helper_data    <= {(BLOCKS*N){1'b0}};
+            complete       <= 1'b0;
         end else begin
             // defaults
-            puf_read_req <= 1'b0;
-            trng_req     <= 1'b0;
             complete     <= 1'b0;
 
             case (state)
                 S_IDLE: begin
-                    have_puf  <= 1'b0;
-                    have_trng <= 1'b0;
+                    have_puf       <= 1'b0;
+                    have_trng      <= 1'b0;
+                    puf_enable     <= 1'b0;
+                    puf_clk        <= 1'b0;
+                    // puf_addr is now controlled by separate always @(posedge puf_clk) block
+                    puf_byte_count <= {($clog2(PUF_BYTES)+1){1'b0}};
+                    puf_read_state <= 1'b0;
+                    trng_enable    <= 1'b0;
+                    trng_clk       <= 1'b0;
+                    trng_bit_count <= {($clog2(BLOCKS)+1){1'b0}};
+                    trng_read_state<= 1'b0;
+
                     if (enable_rising) begin
-                        puf_read_req <= 1'b1;
-                        trng_req     <= 1'b1;
+                        // Start PUF reading on next state
                     end
                 end
 
-                S_REQ: begin
-                    // keep requesting until each arrives
-                    if (!have_puf)  puf_read_req <= 1'b1;
-                    if (!have_trng) trng_req     <= 1'b1;
+                S_PUF_READ: begin
+                    // PUF reading protocol:
+                    // Toggle puf_clk every main clock cycle
+                    // Separate always block handles addr increment on puf_clk rising edge
+                    // Data capture happens on puf_clk falling edge
 
-                    if (puf_valid) begin
-                        puf_raw_reg <= puf_data;  // Store raw PUF data
-                        have_puf    <= 1'b1;
+                    if (!puf_read_state) begin
+                        // First cycle: initialize
+                        puf_enable     <= 1'b1;
+                        puf_clk        <= 1'b0;
+                        puf_read_state <= 1'b1;
+                        puf_byte_count <= {($clog2(PUF_BYTES)+1){1'b0}};
+                    end else begin
+                        // Toggle clock every main clock cycle
+                        puf_clk <= ~puf_clk;
+
+                        // On falling edge of puf_clk: capture data
+                        if (puf_clk) begin
+                            // puf_clk is currently high, about to go low (falling edge)
+                            puf_raw_reg[puf_byte_count*8 +: 8] <= puf_data;
+                            puf_byte_count <= puf_byte_count + 1;
+
+                            // Check if we've read all bytes
+                            if (puf_byte_count >= (PUF_BYTES - 1)) begin
+                                have_puf    <= 1'b1;
+                                puf_enable  <= 1'b0;
+                            end
+                        end
                     end
-                    if (trng_valid) begin
-                        x_reg     <= trng_data;
-                        have_trng <= 1'b1;
+                end
+
+                S_TRNG_READ: begin
+                    // TRNG reading protocol:
+                    // Cycle 0: Assert trng_enable, trng_clk=0
+                    // Cycle 1: trng_clk=1, read 1 bit on rising edge
+                    // Replicate each bit K times in x_reg
+                    // Repeat for BLOCKS cycles
+
+                    if (!trng_read_state) begin
+                        // First cycle after entering state: assert enable, clock low
+                        trng_enable     <= 1'b1;
+                        trng_clk        <= 1'b0;
+                        trng_read_state <= 1'b1;
+                    end else begin
+                        // Reading cycles: toggle clock and capture data
+                        if (!trng_clk) begin
+                            // Clock was low, make it high (data will be ready on rising edge)
+                            trng_clk <= 1'b1;
+                        end else begin
+                            // Clock was high, now on this rising edge we capture data
+                            // Read 1 bit and replicate it K=6 times in x_reg
+                            // Each TRNG bit occupies 6 consecutive bits in x_reg
+                            x_reg[trng_bit_count*6 + 0] <= trng_data;
+                            x_reg[trng_bit_count*6 + 1] <= trng_data;
+                            x_reg[trng_bit_count*6 + 2] <= trng_data;
+                            x_reg[trng_bit_count*6 + 3] <= trng_data;
+                            x_reg[trng_bit_count*6 + 4] <= trng_data;
+                            x_reg[trng_bit_count*6 + 5] <= trng_data;
+
+                            // Prepare for next bit
+                            trng_clk <= 1'b0;
+                            trng_bit_count <= trng_bit_count + 1;
+
+                            // Check if we've read all bits
+                            if (trng_bit_count == (BLOCKS - 1)) begin
+                                have_trng    <= 1'b1;
+                                trng_enable  <= 1'b0;
+                            end
+                        end
                     end
                 end
 
@@ -178,6 +263,27 @@ module device_rfe_gen
 
                 default: ; // no-op
             endcase
+        end
+    end
+
+    // -----------------------------------------------------------------------------
+    // PUF Address Increment Logic (synchronized to puf_clk rising edge)
+    // -----------------------------------------------------------------------------
+    // Address increments AFTER each read, so:
+    // - 1st rising edge: read addr 0, then increment to 1
+    // - 2nd rising edge: read addr 1, then increment to 2
+    // - ...
+    // - 8th rising edge: read addr 7, then increment (but capped at 7)
+    always @(posedge puf_clk or negedge rst_n) begin
+        if (!rst_n) begin
+            puf_addr <= {($clog2(PUF_BYTES)){1'b0}};
+        end else begin
+            if (puf_enable && puf_addr < (PUF_BYTES - 1)) begin
+                // Increment address after each read
+                // This happens on rising edge, so PUF sees current addr,
+                // then we increment for next cycle
+                puf_addr <= puf_addr + 1;
+            end
         end
     end
 

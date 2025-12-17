@@ -20,18 +20,19 @@ module secure_key_system
     input  wire         start_keygen,    // Start key generation process
 
     // ========================================
-    // PUF Interface (exposed from fuzzy extractor)
+    // PUF Interface (exposed from fuzzy extractor) - NEW PROTOCOL
     // ========================================
-    output wire         puf_read_req,
-    input  wire [PUF_BLOCKS*32-1:0] puf_data,     // Raw PUF response (64 bits)
-    input  wire         puf_valid,
+    output wire                         puf_clk,     // Clock for PUF
+    output wire                         puf_enable,  // Enable signal for PUF
+    output wire [$clog2((PUF_BLOCKS*32)/8)-1:0] puf_addr,    // Byte address
+    input  wire [7:0]                   puf_data,    // 8-bit data from PUF
 
     // ========================================
-    // TRNG Interface (exposed from fuzzy extractor)
+    // TRNG Interface (exposed from fuzzy extractor) - NEW PROTOCOL
     // ========================================
-    output wire         trng_req,
-    input  wire [FE_BLOCKS*6-1:0] trng_data,     // Random bits for RM encoding (132 bits)
-    input  wire         trng_valid,
+    output wire         trng_clk,      // Clock for TRNG
+    output wire         trng_enable,   // Enable signal for TRNG
+    input  wire         trng_data,     // 1-bit data from TRNG
 
     // ========================================
     // HMAC Message Interface
@@ -99,15 +100,16 @@ module secure_key_system
         .rst_n(~reset),
         .enable(fe_enable),
 
-        // PUF interface (exposed to top-level)
-        .puf_read_req(puf_read_req),
+        // PUF interface (NEW PROTOCOL - exposed to top-level)
+        .puf_clk(puf_clk),
+        .puf_enable(puf_enable),
+        .puf_addr(puf_addr),
         .puf_data(puf_data),
-        .puf_valid(puf_valid),
 
-        // TRNG interface (exposed to top-level)
-        .trng_req(trng_req),
+        // TRNG interface (NEW PROTOCOL - exposed to top-level)
+        .trng_clk(trng_clk),
+        .trng_enable(trng_enable),
         .trng_data(trng_data),
-        .trng_valid(trng_valid),
 
         // Outputs
         .rprime(fe_rprime),              // Replicated PUF data (704 bits)
