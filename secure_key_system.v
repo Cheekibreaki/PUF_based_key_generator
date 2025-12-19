@@ -44,16 +44,22 @@ module secure_key_system
     output wire         msg_ready,
 
     // ========================================
-    // Outputs
+    // Outputs - Three separate 16-bit buses
     // ========================================
-    output wire [FE_BLOCKS*32-1:0] helper_data,  // Helper data (store in NVM)
-    output wire         helper_data_valid,       // Helper data is ready
+    // Helper Data bus (704 bits over 44 words)
+    output reg  [15:0]  helper_data_out,
+    output reg          helper_data_valid,
+    output reg          helper_data_done,
 
-    output wire [511:0] puf_key,                 // Derived PUF key (512 bits)
-    output wire         puf_key_valid,           // PUF key is ready
+    // PUF Key bus (512 bits over 32 words)
+    output reg  [15:0]  puf_key_out,
+    output reg          puf_key_valid,
+    output reg          puf_key_done,
 
-    output wire [511:0] hmac_value,              // HMAC output
-    output wire         hmac_done                // HMAC operation complete
+    // HMAC Value bus (512 bits over 32 words)
+    output reg  [15:0]  hmac_out,
+    output reg          hmac_valid,
+    output reg          hmac_done
 );
 
     // ========================================================================
@@ -63,12 +69,33 @@ module secure_key_system
     // Fuzzy Extractor signals
     reg                     fe_enable;
     wire [FE_BLOCKS*32-1:0] fe_rprime;           // Replicated PUF data (704 bits)
+    wire [FE_BLOCKS*32-1:0] helper_data_internal; // Helper data from fuzzy extractor
     wire                    fe_complete;
 
     // HMAC top signals
     reg                     start_puf_hash;      // Trigger PUF key generation
     reg  [703:0]            puf_input_to_hmac;   // 704-bit input from fuzzy extractor
+    wire [511:0]            puf_key_internal;    // PUF key from HMAC
+    wire [511:0]            hmac_value_internal; // HMAC output
     wire                    puf_hash_done;       // Done signal from HMAC module
+
+    // Internal storage for outputs
+    reg [FE_BLOCKS*32-1:0]  helper_data_reg;     // 704 bits
+    reg [511:0]             puf_key_reg;         // 512 bits
+    reg [511:0]             hmac_value_reg;      // 512 bits
+
+    // Separate word counters for each 16-bit bus
+    reg [5:0]  helper_word_count;  // 0-43 (44 words for 704 bits)
+    reg [4:0]  puf_key_word_count; // 0-31 (32 words for 512 bits)
+    reg [4:0]  hmac_word_count;    // 0-31 (32 words for 512 bits)
+
+    // Serialization active flags
+    reg        helper_serializing;
+    reg        puf_key_serializing;
+    reg        hmac_serializing;
+
+    // Track if we're doing HMAC operation vs key generation
+    reg        hmac_operation_active;
 
     // FSM state machine
     localparam [2:0] S_IDLE          = 3'd0,
@@ -79,13 +106,6 @@ module secure_key_system
                      S_READY         = 3'd5;
 
     reg [2:0] state, next_state;
-
-    // Output status registers
-    reg helper_data_valid_r;
-    reg puf_key_valid_r;
-
-    assign helper_data_valid = helper_data_valid_r;
-    assign puf_key_valid = puf_key_valid_r;
 
     // ========================================================================
     // Fuzzy Extractor Instance
@@ -112,8 +132,8 @@ module secure_key_system
         .trng_data(trng_data),
 
         // Outputs
-        .rprime(fe_rprime),              // Replicated PUF data (704 bits)
-        .helper_data(helper_data),       // Helper data for storage
+        .rprime(fe_rprime),                    // Replicated PUF data (704 bits)
+        .helper_data(helper_data_internal),    // Helper data for storage
         .complete(fe_complete)
     );
 
@@ -138,12 +158,10 @@ module secure_key_system
         .msg_ready(msg_ready),
 
         // Outputs
-        .puf_key(puf_key),
-        .hmac_value(hmac_value),
+        .puf_key(puf_key_internal),
+        .hmac_value(hmac_value_internal),
         .done(puf_hash_done)
     );
-
-    assign hmac_done = puf_hash_done;  // HMAC done is same as HMAC module done
 
     // ========================================================================
     // FSM: Sequential Logic
@@ -206,23 +224,25 @@ module secure_key_system
     // ========================================================================
     always @(posedge clk) begin
         if (reset) begin
-            fe_enable          <= 1'b0;
-            start_puf_hash     <= 1'b0;
-            puf_input_to_hmac  <= 704'b0;
-            helper_data_valid_r <= 1'b0;
-            puf_key_valid_r    <= 1'b0;
+            fe_enable            <= 1'b0;
+            start_puf_hash       <= 1'b0;
+            puf_input_to_hmac    <= 704'b0;
+            hmac_operation_active<= 1'b0;
         end else begin
             // Default: clear one-shot signals
             fe_enable      <= 1'b0;
             start_puf_hash <= 1'b0;
 
+            // Track HMAC operations
+            if (start_hmac) begin
+                hmac_operation_active <= 1'b1;
+            end else if (puf_hash_done && hmac_operation_active) begin
+                hmac_operation_active <= 1'b0;
+            end
+
             case (state)
                 S_IDLE: begin
-                    // Clear valid flags when starting new key generation
-                    if (start_keygen) begin
-                        helper_data_valid_r <= 1'b0;
-                        puf_key_valid_r    <= 1'b0;
-                    end
+                    // Ready for new key generation
                 end
 
                 S_FE_REQUEST: begin
@@ -235,8 +255,8 @@ module secure_key_system
                     if (fe_complete) begin
                         // Latch rprime output for HMAC
                         puf_input_to_hmac <= fe_rprime;
-                        // Mark helper data as valid
-                        helper_data_valid_r <= 1'b1;
+                        // Latch helper data for 16-bit bus serialization
+                        helper_data_reg <= helper_data_internal;
                     end
                 end
 
@@ -247,9 +267,7 @@ module secure_key_system
 
                 S_WAIT_HASH: begin
                     // Wait for hash completion
-                    if (puf_hash_done) begin
-                        puf_key_valid_r <= 1'b1;
-                    end
+                    // Data latching now happens in serialization blocks
                 end
 
                 S_READY: begin
@@ -261,6 +279,119 @@ module secure_key_system
                     // Reset everything
                 end
             endcase
+        end
+    end
+
+    // ========================================================================
+    // Helper Data 16-bit Output Serialization
+    // ========================================================================
+    always @(posedge clk) begin
+        if (reset) begin
+            helper_data_out     <= 16'b0;
+            helper_data_valid   <= 1'b0;
+            helper_data_done    <= 1'b0;
+            helper_word_count   <= 6'b0;
+            helper_serializing  <= 1'b0;
+        end else begin
+            // Start serialization when data is latched and not already done
+            if (fe_complete && !helper_serializing && !helper_data_done) begin
+                helper_serializing <= 1'b1;
+                helper_word_count  <= 6'b0;
+            end
+
+            // Serialize data
+            if (helper_serializing) begin
+                helper_data_valid <= 1'b1;
+                helper_data_out   <= helper_data_reg[helper_word_count*16 +: 16];
+                helper_word_count <= helper_word_count + 1;
+
+                if (helper_word_count >= 6'd43) begin  // 44 words (0-43)
+                    helper_data_done    <= 1'b1;
+                    helper_data_valid   <= 1'b0;
+                    helper_serializing  <= 1'b0;
+                end
+            end
+
+            // Reset when new key generation starts
+            if (!fe_complete && helper_data_done) begin
+                helper_data_done <= 1'b0;
+            end
+        end
+    end
+
+    // ========================================================================
+    // PUF Key 16-bit Output Serialization
+    // ========================================================================
+    always @(posedge clk) begin
+        if (reset) begin
+            puf_key_out         <= 16'b0;
+            puf_key_valid       <= 1'b0;
+            puf_key_done        <= 1'b0;
+            puf_key_word_count  <= 5'b0;
+            puf_key_serializing <= 1'b0;
+            puf_key_reg         <= 512'b0;
+        end else begin
+            // Latch data when puf_hash_done pulses
+            if (puf_hash_done && !puf_key_serializing && !puf_key_done) begin
+                puf_key_reg         <= puf_key_internal;
+                puf_key_serializing <= 1'b1;
+                puf_key_word_count  <= 5'b0;
+            end
+            // Serialize data (starts the cycle AFTER latching)
+            else if (puf_key_serializing) begin
+                puf_key_valid     <= 1'b1;
+                puf_key_out       <= puf_key_reg[puf_key_word_count*16 +: 16];
+                puf_key_word_count<= puf_key_word_count + 1;
+
+                if (puf_key_word_count >= 5'd31) begin  // 32 words (0-31)
+                    puf_key_done        <= 1'b1;
+                    puf_key_valid       <= 1'b0;
+                    puf_key_serializing <= 1'b0;
+                end
+            end
+
+            // Reset when new key generation starts (start_keygen or reset)
+            if (state == S_IDLE && puf_key_done) begin
+                puf_key_done <= 1'b0;
+            end
+        end
+    end
+
+    // ========================================================================
+    // HMAC Value 16-bit Output Serialization
+    // ========================================================================
+    always @(posedge clk) begin
+        if (reset) begin
+            hmac_out          <= 16'b0;
+            hmac_valid        <= 1'b0;
+            hmac_done         <= 1'b0;
+            hmac_word_count   <= 5'b0;
+            hmac_serializing  <= 1'b0;
+            hmac_value_reg    <= 512'b0;
+        end else begin
+            // Latch data when puf_hash_done pulses AND it's an HMAC operation
+            if (puf_hash_done && hmac_operation_active && !hmac_serializing && !hmac_done) begin
+                hmac_value_reg   <= hmac_value_internal;
+                hmac_serializing <= 1'b1;
+                hmac_word_count  <= 5'b0;
+            end
+            // Serialize data (starts the cycle AFTER latching)
+            else if (hmac_serializing) begin
+                hmac_valid     <= 1'b1;
+                hmac_out       <= hmac_value_reg[hmac_word_count*16 +: 16];
+                hmac_word_count<= hmac_word_count + 1;
+
+                if (hmac_word_count >= 5'd31) begin  // 32 words (0-31)
+                    hmac_done        <= 1'b1;
+                    hmac_valid       <= 1'b0;
+                    hmac_serializing <= 1'b0;
+                end
+            end
+
+            // Reset when new key generation starts
+            if (state == S_IDLE && hmac_done) begin
+                hmac_done <= 1'b0;
+            end
         end
     end
 

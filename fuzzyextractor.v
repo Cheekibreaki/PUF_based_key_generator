@@ -27,7 +27,7 @@ module device_rfe_gen
 
     // TRNG Interface - NEW PROTOCOL
     // Read 1 bit per cycle for BLOCKS cycles, replicate each bit K times
-    output reg                        trng_clk,      // Clock for TRNG
+    output wire                       trng_clk,      // Clock for TRNG (same freq as clk)
     output reg                        trng_enable,   // Enable signal for TRNG
     input  wire                       trng_data,     // 1-bit data from TRNG
 
@@ -48,6 +48,7 @@ module device_rfe_gen
     localparam PUF_BYTES = (PUF_BLOCKS * N) / 8;  // Total bytes to read from PUF
     reg [$clog2(PUF_BYTES):0] puf_byte_count;     // Current byte being read
     reg                       puf_read_state;     // 0=wait, 1=reading
+    reg [1:0]                 puf_cycle_count;    // Count cycles before starting read
 
     // TRNG reading state machine
     reg [$clog2(BLOCKS):0]    trng_bit_count;     // Current bit being read (0 to BLOCKS-1)
@@ -126,6 +127,9 @@ module device_rfe_gen
     // PUF clock generation - runs at same frequency as main clk when enabled
     assign puf_clk = (puf_enable && state == S_PUF_READ) ? clk : 1'b0;
 
+    // TRNG clock generation - runs at same frequency as main clk when enabled
+    assign trng_clk = (trng_enable && state == S_TRNG_READ) ? clk : 1'b0;
+
     // State register
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) state <= S_IDLE;
@@ -146,12 +150,12 @@ module device_rfe_gen
     // Outputs and latches
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            // puf_clk is now a wire, driven by assign statement
+            // puf_clk and trng_clk are now wires, driven by assign statements
             puf_enable     <= 1'b0;
             // puf_addr is now controlled by separate always @(posedge puf_clk) block
             puf_byte_count <= {($clog2(PUF_BYTES)+1){1'b0}};
             puf_read_state <= 1'b0;
-            trng_clk       <= 1'b0;
+            puf_cycle_count<= 2'b0;
             trng_enable    <= 1'b0;
             trng_bit_count <= {($clog2(BLOCKS)+1){1'b0}};
             trng_read_state<= 1'b0;
@@ -171,12 +175,12 @@ module device_rfe_gen
                     have_puf       <= 1'b0;
                     have_trng      <= 1'b0;
                     puf_enable     <= 1'b0;
-                    // puf_clk is now a wire, driven by assign statement
+                    // puf_clk and trng_clk are now wires, driven by assign statements
                     // puf_addr is now controlled by separate always @(posedge puf_clk) block
                     puf_byte_count <= {($clog2(PUF_BYTES)+1){1'b0}};
                     puf_read_state <= 1'b0;
+                    puf_cycle_count<= 2'b0;
                     trng_enable    <= 1'b0;
-                    trng_clk       <= 1'b0;
                     trng_bit_count <= {($clog2(BLOCKS)+1){1'b0}};
                     trng_read_state<= 1'b0;
 
@@ -187,25 +191,34 @@ module device_rfe_gen
 
                 S_PUF_READ: begin
                     // PUF reading protocol:
+                    // Cycle 0: Enable PUF (puf_enable = 1, puf_clk starts running)
+                    // Cycle 1: Wait (setup time)
+                    // Cycle 2+: Start reading data and incrementing address
                     // puf_clk = clk when puf_enable is high
                     // Address increments on puf_clk rising edge (separate always block)
-                    // Data capture happens every clock cycle
 
                     if (!puf_read_state) begin
-                        // First cycle: initialize and enable
-                        puf_enable     <= 1'b1;
-                        puf_read_state <= 1'b1;
-                        puf_byte_count <= {($clog2(PUF_BYTES)+1){1'b0}};
+                        // Cycle 0: Initialize and enable PUF
+                        puf_enable      <= 1'b1;
+                        puf_read_state  <= 1'b1;
+                        puf_byte_count  <= {($clog2(PUF_BYTES)+1){1'b0}};
+                        puf_cycle_count <= 2'b0;
                     end else begin
-                        // Every clock cycle: capture data from PUF
-                        // Address was already incremented on rising edge by separate always block
-                        puf_raw_reg[puf_byte_count*8 +: 8] <= puf_data;
-                        puf_byte_count <= puf_byte_count + 1;
+                        // Count cycles
+                        if (puf_cycle_count < 2'd2) begin
+                            // Cycles 1-2: Wait before starting read
+                            puf_cycle_count <= puf_cycle_count + 1;
+                        end else begin
+                            // Cycle 2+: Start capturing data from PUF
+                            // Address was already incremented on rising edge by separate always block
+                            puf_raw_reg[puf_byte_count*8 +: 8] <= puf_data;
+                            puf_byte_count <= puf_byte_count + 1;
 
-                        // Check if we've read all bytes
-                        if (puf_byte_count >= (PUF_BYTES - 1)) begin
-                            have_puf    <= 1'b1;
-                            puf_enable  <= 1'b0;
+                            // Check if we've read all bytes
+                            if (puf_byte_count >= (PUF_BYTES - 1)) begin
+                                have_puf    <= 1'b1;
+                                puf_enable  <= 1'b0;
+                            end
                         end
                     end
                 end
@@ -218,35 +231,25 @@ module device_rfe_gen
                     // Repeat for BLOCKS cycles
 
                     if (!trng_read_state) begin
-                        // First cycle after entering state: assert enable, clock low
+                        // Cycle 0: Initialize and enable TRNG
                         trng_enable     <= 1'b1;
-                        trng_clk        <= 1'b0;
                         trng_read_state <= 1'b1;
+                        trng_bit_count  <= {($clog2(BLOCKS)+1){1'b0}};
                     end else begin
-                        // Reading cycles: toggle clock and capture data
-                        if (!trng_clk) begin
-                            // Clock was low, make it high (data will be ready on rising edge)
-                            trng_clk <= 1'b1;
-                        end else begin
-                            // Clock was high, now on this rising edge we capture data
-                            // Read 1 bit and replicate it K=6 times in x_reg
-                            // Each TRNG bit occupies 6 consecutive bits in x_reg
-                            x_reg[trng_bit_count*6 + 0] <= trng_data;
-                            x_reg[trng_bit_count*6 + 1] <= trng_data;
-                            x_reg[trng_bit_count*6 + 2] <= trng_data;
-                            x_reg[trng_bit_count*6 + 3] <= trng_data;
-                            x_reg[trng_bit_count*6 + 4] <= trng_data;
-                            x_reg[trng_bit_count*6 + 5] <= trng_data;
+                        // Every clock cycle: read 1 bit and replicate it K=6 times
+                        x_reg[trng_bit_count*6 + 0] <= trng_data;
+                        x_reg[trng_bit_count*6 + 1] <= trng_data;
+                        x_reg[trng_bit_count*6 + 2] <= trng_data;
+                        x_reg[trng_bit_count*6 + 3] <= trng_data;
+                        x_reg[trng_bit_count*6 + 4] <= trng_data;
+                        x_reg[trng_bit_count*6 + 5] <= trng_data;
 
-                            // Prepare for next bit
-                            trng_clk <= 1'b0;
-                            trng_bit_count <= trng_bit_count + 1;
+                        trng_bit_count <= trng_bit_count + 1;
 
-                            // Check if we've read all bits
-                            if (trng_bit_count == (BLOCKS - 1)) begin
-                                have_trng    <= 1'b1;
-                                trng_enable  <= 1'b0;
-                            end
+                        // Check if we read all BLOCKS bits
+                        if (trng_bit_count >= (BLOCKS - 1)) begin
+                            have_trng    <= 1'b1;
+                            trng_enable  <= 1'b0;
                         end
                     end
                 end
@@ -266,20 +269,30 @@ module device_rfe_gen
     // -----------------------------------------------------------------------------
     // PUF Address Increment Logic (synchronized to puf_clk rising edge)
     // -----------------------------------------------------------------------------
-    // Address increments AFTER each read, so:
-    // - 1st rising edge: read addr 0, then increment to 1
-    // - 2nd rising edge: read addr 1, then increment to 2
+    // Wait 2 cycles before starting address increments:
+    // - Rising edge 0: puf_enable goes high, addr stays 0 (wait)
+    // - Rising edge 1: addr stays 0 (wait)
+    // - Rising edge 2: PUF outputs data at addr 0, then addr increments to 1
+    // - Rising edge 3: PUF outputs data at addr 1, then addr increments to 2
     // - ...
-    // - 8th rising edge: read addr 7, then increment (but capped at 7)
+    reg [1:0] puf_clk_cycle_count;
+
     always @(posedge puf_clk or negedge rst_n) begin
         if (!rst_n) begin
             puf_addr <= {($clog2(PUF_BYTES)){1'b0}};
+            puf_clk_cycle_count <= 2'b0;
         end else begin
-            if (puf_enable && puf_addr < (PUF_BYTES - 1)) begin
-                // Increment address after each read
-                // This happens on rising edge, so PUF sees current addr,
-                // then we increment for next cycle
-                puf_addr <= puf_addr + 1;
+            if (puf_enable) begin
+                if (puf_clk_cycle_count < 2'd2) begin
+                    // Cycles 0-1: Wait, don't increment address yet
+                    puf_clk_cycle_count <= puf_clk_cycle_count + 1;
+                end else if (puf_addr < (PUF_BYTES - 1)) begin
+                    // Cycle 2+: Increment address after each read
+                    puf_addr <= puf_addr + 1;
+                end
+            end else begin
+                // Reset counter when not enabled
+                puf_clk_cycle_count <= 2'b0;
             end
         end
     end
